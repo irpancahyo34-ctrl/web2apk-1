@@ -3,56 +3,60 @@ name: Build Web to APK
 on:
   workflow_dispatch:
     inputs:
-      web_url:
-        description: 'URL website'
+      url:
+        description: 'URL website yang mau dijadikan APK'
         required: true
+        default: 'https://example.com'
       app_name:
         description: 'Nama aplikasi'
         required: true
+        default: 'My App'
+      package_name:
+        description: 'Package name (contoh: com.myapp.web)'
+        required: true
+        default: 'com.web2apk.webapp'
       icon_url:
-        description: 'URL icon (PNG)'
-        required: true
-      tag:
-        description: 'Tag build'
-        required: true
+        description: 'URL icon (PNG, opsional)'
+        required: false
+        default: ''
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ===== Setup Java 17 =====
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
           java-version: '17'
 
+      # ===== Setup Flutter versi BARU (fix error Kotlin) =====
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.32.0'
           channel: 'stable'
           cache: true
 
-      - name: Download icon
-        run: |
-          curl -L -o icon.png "${{ github.event.inputs.icon_url }}"
-          ls -lh icon.png
-
+      # ===== Buat proyek Flutter =====
       - name: Create Flutter project
         run: |
           flutter create --org com.web2apk --project-name webapp webapp
 
-      - name: Add webview_flutter
+      # ===== Tambah plugin webview + launcher icons =====
+      - name: Add dependencies
         working-directory: webapp
         run: |
           flutter pub add webview_flutter
           flutter pub add flutter_launcher_icons --dev
 
-      - name: Replace main.dart
+      # ===== Tulis kode main.dart =====
+      - name: Write main.dart
         working-directory: webapp
         run: |
           cat > lib/main.dart << 'DART_EOF'
@@ -86,20 +90,54 @@ jobs:
               super.initState();
               controller = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                ..loadRequest(Uri.parse('${{ github.event.inputs.web_url }}'));
+                ..setBackgroundColor(const Color(0x00000000))
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onProgress: (int progress) {},
+                    onPageStarted: (String url) {},
+                    onPageFinished: (String url) {},
+                    onWebResourceError: (WebResourceError error) {},
+                  ),
+                )
+                ..loadRequest(Uri.parse('${{ github.event.inputs.url }}'));
             }
             @override
             Widget build(BuildContext context) {
-              return Scaffold(body: SafeArea(child: WebViewWidget(controller: controller)));
+              return Scaffold(
+                body: SafeArea(child: WebViewWidget(controller: controller)),
+              );
             }
           }
           DART_EOF
 
-      - name: Setup icon
+      # ===== Ganti nama aplikasi di AndroidManifest =====
+      - name: Set app label
+        working-directory: webapp
+        run: |
+          sed -i 's/android:label="webapp"/android:label="${{ github.event.inputs.app_name }}"/' android/app/src/main/AndroidManifest.xml
+
+      # ===== Set package name custom (opsional) =====
+      - name: Set package name
+        working-directory: webapp
+        run: |
+          PKG="${{ github.event.inputs.package_name }}"
+          if [ -n "$PKG" ]; then
+            find android/app/src/main/kotlin -type f -name "*.kt" | while read f; do
+              sed -i "s/package com.web2apk.webapp/package $PKG/" "$f"
+            done
+            sed -i "s/namespace = \"com.web2apk.webapp\"/namespace = \"$PKG\"/" android/app/build.gradle.kts 2>/dev/null || true
+            sed -i "s/applicationId \"com.web2apk.webapp\"/applicationId \"$PKG\"/" android/app/build.gradle.kts 2>/dev/null || true
+            sed -i "s/applicationId 'com.web2apk.webapp'/applicationId '$PKG'/" android/app/build.gradle 2>/dev/null || true
+            sed -i "s/package=\"com.web2apk.webapp\"/package=\"$PKG\"/" android/app/src/main/AndroidManifest.xml || true
+          fi
+
+      # ===== Icon (kalau user kirim URL icon) =====
+      - name: Setup launcher icon
+        if: ${{ github.event.inputs.icon_url != '' }}
         working-directory: webapp
         run: |
           mkdir -p assets
-          cp ../icon.png assets/icon.png
+          curl -L -o assets/icon.png "${{ github.event.inputs.icon_url }}"
           cat > flutter_launcher_icons.yaml << 'YAML_EOF'
           flutter_launcher_icons:
             android: true
@@ -108,28 +146,17 @@ jobs:
             adaptive_icon_background: "#ffffff"
             adaptive_icon_foreground: "assets/icon.png"
           YAML_EOF
+          flutter pub get
+          flutter pub run flutter_launcher_icons
 
-      - name: Rename app
-        working-directory: webapp
-        run: |
-          sed -i 's/android:label="webapp"/android:label="${{ github.event.inputs.app_name }}"/' android/app/src/main/AndroidManifest.xml
-
-      - name: Pub get
-        working-directory: webapp
-        run: flutter pub get
-
-      - name: Generate icons
-        working-directory: webapp
-        run: flutter pub run flutter_launcher_icons
-
+      # ===== Build APK =====
       - name: Build APK
         working-directory: webapp
-        run: flutter build apk --release --no-pub
+        run: flutter build apk --release
 
+      # ===== Upload APK sebagai artifact =====
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ github.event.inputs.tag }}
+          name: web-to-apk-${{ github.run_number }}
           path: webapp/build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
-          retention-days: 7
